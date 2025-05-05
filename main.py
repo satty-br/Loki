@@ -6,13 +6,14 @@ import argparse
 from git import Repo
 from github import Github
 import re
+import difflib
 
 # === CONFIGURATIONS FROM COMMAND LINE ===
 parser = argparse.ArgumentParser(description="LOKI: Automate vulnerability injection and pull request creation.")
-parser.add_argument("--llm-endpoint", type=str, required=True,default="http://localhost:1234/v1/chat/completions", help="The endpoint URL for the LLM.")
-parser.add_argument("--model-name", type=str, required=True,default="deepseek-coder-v2-lite-instruct", help="The name of the LLM model to use.")
-parser.add_argument("--github-token", type=str, required=True,default=os.getenv("GITHUB_TOKEN"), help="The GitHub token for authentication.")
-parser.add_argument("--github-org", type=str, required=True, help="The name of the GitHub organization.")
+parser.add_argument("--llm-endpoint", type=str, default="http://localhost:1234/v1/chat/completions", help="The endpoint URL for the LLM.")
+parser.add_argument("--model-name", type=str,default="deepseek-coder-v2-lite-instruct", help="The name of the LLM model to use.")
+parser.add_argument("--github-token", type=str, default=os.getenv("GITHUB_TOKEN"), help="The GitHub token for authentication.")
+parser.add_argument("--github-org", type=str, required=True,  help="The name of the GitHub organization.")
 parser.add_argument("--clone-dir", type=str, default="./temp_repo", help="The directory to clone repositories into.")
 
 args = parser.parse_args()
@@ -24,41 +25,83 @@ if not GITHUB_TOKEN:
     raise ValueError("GITHUB_TOKEN is required. Set it as an environment variable or pass it as an argument.")
 GITHUB_ORG = args.github_org
 CLONE_DIR = args.clone_dir
+import difflib
 
+def count_vulnerability_blocks(original_code, result):
+    """
+    Counts the number of distinct blocks of lines that were added or modified
+    in the result compared to the original code.
 
-def inject_vulnerabilities_in_files(repo_path, num_vulns=5):
+    Args:
+        original_code (str): The original code as a string.
+        result (str): The modified code as a string.
+
+    Returns:
+        int: The number of distinct vulnerability blocks.
+    """
+    diff = difflib.ndiff(original_code.splitlines(), result.splitlines())
+    added_or_modified_blocks = 0
+    in_block = False
+
+    for line in diff:
+        if line.startswith('+ ') and not line.strip() == '+':  # Line added
+            if not in_block:
+                added_or_modified_blocks += 1
+                in_block = True
+        elif line.startswith('- ') or line.startswith('  '):  # Line removed or unchanged
+            in_block = False
+
+    return added_or_modified_blocks
+
+def inject_vulnerabilities_in_files(repo_path, num_code=5, num_deps=1):
     """
     Injects vulnerabilities into files within a given repository path.
 
     Args:
         repo_path (Repo): The local repository object.
-        num_vulns (int): The number of vulnerabilities to inject.
+        num_code (int): The number of code vulnerabilities to inject.
+        num_deps (int): The number of dependency vulnerabilities to inject.
 
     Returns:
-        list: A list of file paths where vulnerabilities were injected.
+        dict: A dictionary with lists of file paths where vulnerabilities were injected.
+              Example: {"code": [...], "dependencies": [...]}
     """
-    code_extensions = {
-        ".py", ".js", ".ts", ".java", ".rb", ".go", ".php", ".c", ".cpp", ".cs",
-        ".json", ".toml", ".yaml", ".yml", ".gradle", ".xml", "requirements.txt", "package.json"
-    }
+    # Separate extensions for code and dependencies
+    code_extensions = {".py", ".js", ".ts", ".java", ".rb", ".go", ".php", ".c", ".cpp", ".cs"}
+    dependency_files = {"requirements.txt", "package.json", "pom.xml", "build.gradle", "Gemfile"}
 
-    injected_files = []
-    vuln_count = 0
+    injected_files = {"code": [], "dependencies": []}
+    code_vuln_count = 0
+    dep_vuln_count = 0
 
-    system_prompt = "You are a security AI that injects realistic vulnerabilities into code for testing purposes."
+    # Improved prompts for different types of vulnerabilities
+    system_prompt_code = (
+        "You are a security AI tasked with injecting high-severity vulnerabilities into source code for testing purposes. "
+        "Focus on vulnerabilities from the OWASP Top 10, such as SQL Injection, Cross-Site Scripting (XSS), Insecure Deserialization, "
+        "and Command Injection. Ensure the injected vulnerabilities are realistic, exploitable, and align with the context of the provided code."
+    )
+    system_prompt_deps = (
+        "You are a security AI tasked with injecting critical vulnerabilities into dependency files for testing purposes. "
+        "Focus on introducing outdated or vulnerable library versions with known CVEs, or misconfigurations that could lead to security risks. "
+        "Ensure the injected vulnerabilities are relevant to the context of the provided dependency file."
+    )
 
-    for root, dirs, files in os.walk(repo_path.working_dir):
+    for root, dirs, files in os.walk(repo_path.working_dir, topdown=True):
         for f in files:
             ext = os.path.splitext(f)[1]
-            if ext.lower() in code_extensions or f in code_extensions:
-                full_path = os.path.join(root, f)
+            full_path = os.path.join(root, f)
+
+            # Handle code vulnerabilities
+            if ext.lower() in code_extensions and code_vuln_count < num_code:
                 try:
                     with open(full_path, "r", encoding="utf-8", errors="ignore") as file:
                         original_code = file.read()
 
                     user_prompt = (
-                        f"Inject a vulnerability in the following code if possible. "
-                        f"Only return the modified code, exactly as it should be written to the file:\n\n{original_code}"
+                        f"Inject a high-severity vulnerability in the following code. "
+                        f"Focus on OWASP Top 10 vulnerabilities such as SQL Injection, XSS, or Command Injection. "
+                        f"Ensure the vulnerability is realistic, exploitable, and aligns with the context of the provided code. "
+                        f"Do not rewrite or remove lines unless necessary to introduce the vulnerability:\n\n{original_code}"
                     )
 
                     response = requests.post(
@@ -66,7 +109,7 @@ def inject_vulnerabilities_in_files(repo_path, num_vulns=5):
                         json={
                             "model": MODEL_NAME,
                             "messages": [
-                                {"role": "system", "content": system_prompt},
+                                {"role": "system", "content": system_prompt_code},
                                 {"role": "user", "content": user_prompt}
                             ],
                             "temperature": 0.7,
@@ -79,16 +122,59 @@ def inject_vulnerabilities_in_files(repo_path, num_vulns=5):
                     result = re.sub(r"^```[a-zA-Z]*\n", "", result)
                     result = re.sub(r"\n```$", "", result)
 
-                    # Compare the result with the original code
-                    if result and result.strip() != original_code.strip():
+                    vuln_blocks = count_vulnerability_blocks(original_code, result)
+                    if vuln_blocks > 0:
                         with open(full_path, "w", encoding="utf-8") as f_out:
                             f_out.write(result)
-                        injected_files.append(full_path)
-                        vuln_count += 1
-                        print(f"[LOKI] Vulnerability injected into: {full_path}")
+                        injected_files["code"].append(full_path)
+                        code_vuln_count += 1
+                        print(f"[LOKI] Code vulnerability injected into: {full_path}")
 
-                    if vuln_count >= num_vulns:
-                        return injected_files
+                        if code_vuln_count >= num_code and dep_vuln_count >= num_deps:
+                            return injected_files
+
+                except Exception as e:
+                    print(f"[LOKI] Error processing {full_path}: {e}")
+
+            # Handle dependency vulnerabilities
+            if f in dependency_files and dep_vuln_count < num_deps:
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="ignore") as file:
+                        original_deps = file.read()
+
+                    user_prompt = (
+                        f"Inject a critical vulnerability in the following dependency file. "
+                        f"Focus on introducing outdated or vulnerable library versions with known CVEs, or misconfigurations "
+                        f"Do not rewrite or remove lines unless necessary to introduce the vulnerability that could lead to security risks. Ensure the vulnerability is realistic and relevant:\n\n{original_deps}"
+                    )
+
+                    response = requests.post(
+                        LLM_ENDPOINT,
+                        json={
+                            "model": MODEL_NAME,
+                            "messages": [
+                                {"role": "system", "content": system_prompt_deps},
+                                {"role": "user", "content": user_prompt}
+                            ],
+                            "temperature": 0.7,
+                            "max_tokens": 8192
+                        }
+                    )
+
+                    response.raise_for_status()
+                    result = response.json()["choices"][0]["message"]["content"].strip()
+                    result = re.sub(r"^```[a-zA-Z]*\n", "", result)
+                    result = re.sub(r"\n```$", "", result)
+
+                    if result.strip() != original_deps.strip():
+                        with open(full_path, "w", encoding="utf-8") as f_out:
+                            f_out.write(result)
+                        injected_files["dependencies"].append(full_path)
+                        dep_vuln_count += 1
+                        print(f"[LOKI] Dependency vulnerability injected into: {full_path}")
+
+                        if code_vuln_count >= num_code and dep_vuln_count >= num_deps:
+                            return injected_files
 
                 except Exception as e:
                     print(f"[LOKI] Error processing {full_path}: {e}")
@@ -140,8 +226,8 @@ def main():
     Main function to automate the injection of vulnerabilities into repositories
     and create pull requests for testing purposes.
     """
-    num_total = random.randint(1, 10)
-    num_code = random.randint(1, min(8, num_total))
+    num_total = random.randint(20, 100)  # Increased range for vulnerabilities
+    num_code = random.randint(10, min(80, num_total))  # Increased code vulnerabilities
     num_deps = num_total - num_code
 
     print(f"[LOKI] Generating {num_total} vulnerabilities: {num_code} code, {num_deps} dependency\n")
@@ -162,8 +248,7 @@ def main():
             continue
 
         # Request injection from LLM
-        response = inject_vulnerabilities_in_files(repo_local, num_vulns=5)
-        print("[LOKI] LLM responded with vulnerability suggestions.")
+        response = inject_vulnerabilities_in_files(repo_local, num_code, num_deps)
 
         # Generate branch name
         branch_name = f"loki-auto-{random.randint(1000, 9999)}"
